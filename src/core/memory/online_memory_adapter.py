@@ -247,8 +247,8 @@ class OnlineMemoryAdapter:
                 "async_mode": async_mode
             }
 
-            # 发送请求
-            url = f"{self.base_url}/memories/message"
+            # 发送请求（注意：端点是 /memories/messages 复数形式）
+            url = f"{self.base_url}/memories/messages"
 
             headers = {}
             if self.api_key:
