@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     app_env: str = Field(default="development", alias="APP_ENV")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
     secret_key: str = Field(default="dev-secret-key-change-in-production", alias="SECRET_KEY")
+    debug_mode: bool = Field(default=False, alias="DEBUG_MODE")
 
     # Database
     database_url: str = Field(

@@ -81,7 +81,13 @@ class MemoryDrivenAgent:
             progress_callback(progress_value, desc)
 
         if session_id:
-            state = self.session_manager.get_session(session_id)
+            # 将字符串 session_id 转换为 UUID
+            try:
+                session_uuid = UUID(session_id) if isinstance(session_id, str) else session_id
+                state = self.session_manager.get_session(session_uuid)
+            except (ValueError, AttributeError):
+                state = None
+
             if not state:
                 state = self.session_manager.create_session()
         else:
