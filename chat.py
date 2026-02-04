@@ -13,6 +13,7 @@ Commands:
 import asyncio
 import sys
 from pathlib import Path
+from typing import Optional
 from uuid import UUID
 
 from prompt_toolkit import PromptSession
@@ -29,24 +30,27 @@ from src.infrastructure.utils.cli_colors import (
     format_tool_call, format_tool_success, format_tool_error,
     Colors, dim, draw_separator
 )
+from src.skills.initialize import initialize_all_tools
 
 
 class ChatInterface:
     """Interactive chat interface for the agent."""
 
-    def __init__(self, use_reasoner: bool = False):
+    def __init__(self, use_reasoner: bool = False, fixed_skill_id: Optional[str] = None):
         """
         Initialize chat interface.
 
         Args:
             use_reasoner: If True, use deepseek-reasoner (shows thinking).
                          If False, use deepseek-chat (faster, no thinking).
+            fixed_skill_id: If provided, always use this skill ID instead of LLM selection.
         """
         self.session_id = None
         self.message_count = 0
         self.db = None
         self.agent = None
         self.use_reasoner = use_reasoner
+        self.fixed_skill_id = fixed_skill_id
 
         # Initialize prompt_toolkit session
         self.prompt_session = PromptSession()
@@ -80,6 +84,11 @@ class ChatInterface:
         mode_text = "Reasoner" if self.use_reasoner else "Chat"
         mode_color = Colors.BRIGHT_YELLOW if self.use_reasoner else Colors.BRIGHT_GREEN
         print(f"\n{Colors.BRIGHT_WHITE}        A S S I S T{Colors.RESET}  {dim('|')}  {mode_color}{mode_text}{Colors.RESET} {dim('Mode')}")
+
+        # Show fixed skill mode if enabled
+        if self.fixed_skill_id:
+            print(f"\n{Colors.BRIGHT_CYAN}[固定 Skill 模式]{Colors.RESET} 使用 skill: {Colors.BRIGHT_WHITE}{self.fixed_skill_id}{Colors.RESET}")
+            print(f"{dim('跳过 LLM 自动选择，所有对话使用此 skill')}")
 
         # Separator
         print(f"\n{dim('─' * 60)}\n")
@@ -144,7 +153,11 @@ class ChatInterface:
         # Initialize database and agent
         async for db in get_db():
             self.db = db
-            self.agent = MemoryDrivenAgent(db, use_reasoner=self.use_reasoner)
+            self.agent = MemoryDrivenAgent(
+                db,
+                use_reasoner=self.use_reasoner,
+                fixed_skill_id=self.fixed_skill_id
+            )
 
             try:
                 while True:
@@ -246,15 +259,23 @@ def main():
     """Main entry point."""
     import argparse
 
+    # Initialize all skill tools
+    initialize_all_tools()
+
     parser = argparse.ArgumentParser(description='GauzAssist - 你的智能助手')
     parser.add_argument(
         '--reasoner',
         action='store_true',
         help='使用 Reasoner 模式（显示思考过程）'
     )
+    parser.add_argument(
+        '--skill',
+        type=str,
+        help='固定加载指定的 skill ID，跳过 LLM 自动选择'
+    )
     args = parser.parse_args()
 
-    chat = ChatInterface(use_reasoner=args.reasoner)
+    chat = ChatInterface(use_reasoner=args.reasoner, fixed_skill_id=args.skill)
     try:
         asyncio.run(chat.chat_loop())
     except KeyboardInterrupt:

@@ -43,6 +43,7 @@ class Skill(Base):
 
     # Configuration
     tool_set: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    model_config: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
 
     # Temporal fields
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

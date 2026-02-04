@@ -28,18 +28,20 @@ from src.core.utils.debug import debug_print
 class MemoryDrivenAgent:
     """记忆驱动的统一 Agent"""
 
-    def __init__(self, db: AsyncSession, use_reasoner: bool = False):
+    def __init__(self, db: AsyncSession, use_reasoner: bool = False, fixed_skill_id: Optional[str] = None):
         """
         初始化 Agent
 
         Args:
             db: 数据库会话
             use_reasoner: 是否使用 reasoner 模式
+            fixed_skill_id: 固定使用的 skill ID，如果提供则跳过 LLM 自动选择
         """
         self.db = db
         self.llm_client = DeepSeekClient(use_reasoner=use_reasoner)
         self.session_manager = get_session_manager()
         self.max_iterations = 20
+        self.fixed_skill_id = fixed_skill_id
 
         # 服务层
         self.embedding_service = EmbeddingService()
@@ -106,55 +108,91 @@ class MemoryDrivenAgent:
             query_embedding = await self.embedding_service.generate(user_message)
             tracker.end_sync_step("生成查询向量")
 
-            # 2. 检索 skills
-            tracker.start_sync_step("检索技能")
-            if progress_callback is not None:
-                progress_value, desc = tracker.get_progress()
-                progress_callback(progress_value, desc)
-            candidate_skills = await self.skill_service.retrieve_skills(
-                query_embedding, top_k=3
-            )
-            tracker.end_sync_step("检索技能")
+            # 2. 检索 skills（如果有固定 skill 则跳过）
+            if self.fixed_skill_id:
+                # 固定 skill 模式：直接加载指定 skill
+                tracker.start_sync_step("加载固定技能")
+                if progress_callback is not None:
+                    progress_value, desc = tracker.get_progress()
+                    progress_callback(progress_value, desc)
 
-            # 3. 【并行优化】同时执行线上记忆召回和 LLM 过滤 skills
-            tracker.start_async_step("线上记忆召回")
-            tracker.start_sync_step("LLM过滤技能")
-            if progress_callback is not None:
-                progress_value, desc = tracker.get_progress()
-                progress_callback(progress_value, desc)
+                selected_skill = await self.skill_service.get_skill_by_id(self.fixed_skill_id)
+                if not selected_skill:
+                    error_msg = f"错误：找不到 skill '{self.fixed_skill_id}'"
+                    debug_print(error_msg)
+                    tracker.end_sync_step("加载固定技能", error=error_msg)
+                    return {
+                        "success": False,
+                        "error": error_msg,
+                        "session_id": str(state.session_id)
+                    }
 
-            # 并行执行两个任务（带异常处理）
-            try:
-                online_memories, filter_result = await asyncio.gather(
-                    self.online_memory_adapter.recall_memories(query=user_message, top_k=5),
-                    self.filter_service.filter_skills_and_facts(
-                        user_query=user_message,
-                        candidate_skills=candidate_skills,
-                        candidate_facts=[]  # 不再使用本地 facts
-                    )
-                )
-                tracker.end_async_step("线上记忆召回")
-                tracker.end_sync_step("LLM过滤技能")
-            except Exception as e:
-                # 如果线上记忆召回失败，使用空列表继续
-                debug_print(f"⚠️ 线上记忆召回或过滤失败: {e}")
-                tracker.end_async_step("线上记忆召回", error=str(e))
+                debug_print(f"[DEBUG] 使用固定 skill: {selected_skill.name} (ID: {selected_skill.id})")
+                filter_result = {"skill_id": self.fixed_skill_id, "fact_ids": [], "reasoning": "使用固定 skill 模式"}
+                tracker.end_sync_step("加载固定技能")
 
-                # 重新执行 LLM 过滤（如果失败的话）
+                # 仍然执行线上记忆召回
+                tracker.start_async_step("线上记忆召回")
+                if progress_callback is not None:
+                    progress_value, desc = tracker.get_progress()
+                    progress_callback(progress_value, desc)
                 try:
-                    filter_result = await self.filter_service.filter_skills_and_facts(
-                        user_query=user_message,
-                        candidate_skills=candidate_skills,
-                        candidate_facts=[]
-                    )
-                    tracker.end_sync_step("LLM过滤技能")
-                except Exception as filter_error:
-                    debug_print(f"⚠️ LLM 过滤失败: {filter_error}")
-                    tracker.end_sync_step("LLM过滤技能", error=str(filter_error))
-                    # 使用默认值
-                    filter_result = {"skill_id": None, "fact_ids": []}
+                    online_memories = await self.online_memory_adapter.recall_memories(query=user_message, top_k=5)
+                    tracker.end_async_step("线上记忆召回")
+                except Exception as e:
+                    debug_print(f"⚠️ 线上记忆召回失败: {e}")
+                    tracker.end_async_step("线上记忆召回", error=str(e))
+                    online_memories = []
+            else:
+                # 原有逻辑：LLM 自动选择
+                tracker.start_sync_step("检索技能")
+                if progress_callback is not None:
+                    progress_value, desc = tracker.get_progress()
+                    progress_callback(progress_value, desc)
+                candidate_skills = await self.skill_service.retrieve_skills(
+                    query_embedding, top_k=3
+                )
+                tracker.end_sync_step("检索技能")
 
-                online_memories = []
+                # 3. 【并行优化】同时执行线上记忆召回和 LLM 过滤 skills
+                tracker.start_async_step("线上记忆召回")
+                tracker.start_sync_step("LLM过滤技能")
+                if progress_callback is not None:
+                    progress_value, desc = tracker.get_progress()
+                    progress_callback(progress_value, desc)
+
+                # 并行执行两个任务（带异常处理）
+                try:
+                    online_memories, filter_result = await asyncio.gather(
+                        self.online_memory_adapter.recall_memories(query=user_message, top_k=5),
+                        self.filter_service.filter_skills_and_facts(
+                            user_query=user_message,
+                            candidate_skills=candidate_skills,
+                            candidate_facts=[]  # 不再使用本地 facts
+                        )
+                    )
+                    tracker.end_async_step("线上记忆召回")
+                    tracker.end_sync_step("LLM过滤技能")
+                except Exception as e:
+                    # 如果线上记忆召回失败，使用空列表继续
+                    debug_print(f"⚠️ 线上记忆召回或过滤失败: {e}")
+                    tracker.end_async_step("线上记忆召回", error=str(e))
+
+                    # 重新执行 LLM 过滤（如果失败的话）
+                    try:
+                        filter_result = await self.filter_service.filter_skills_and_facts(
+                            user_query=user_message,
+                            candidate_skills=candidate_skills,
+                            candidate_facts=[]
+                        )
+                        tracker.end_sync_step("LLM过滤技能")
+                    except Exception as filter_error:
+                        debug_print(f"⚠️ LLM 过滤失败: {filter_error}")
+                        tracker.end_sync_step("LLM过滤技能", error=str(filter_error))
+                        # 使用默认值
+                        filter_result = {"skill_id": None, "fact_ids": []}
+
+                    online_memories = []
 
             # 4. 根据 skill_id 获取工具集和 prompt
             tracker.start_sync_step("准备工具和Prompt")

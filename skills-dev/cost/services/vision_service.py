@@ -11,6 +11,10 @@ from typing import Dict, Any, Optional
 import os
 import base64
 from openai import OpenAI
+from dotenv import load_dotenv
+
+# 加载环境变量
+load_dotenv()
 
 
 def get_vision_client():
@@ -25,34 +29,101 @@ def get_vision_client():
 
 
 def convert_cad_to_image(
-    file_id: str,
+    file_path: str,
     output_format: str = "png",
-    layers: Optional[list] = None
+    layers: Optional[list] = None,
+    render_mode: str = "regions"
 ) -> Dict[str, Any]:
     """
     将CAD文件转换为图片
 
     Args:
-        file_id: CAD文件ID
+        file_path: CAD文件路径
         output_format: 输出格式（png/jpg/pdf）
         layers: 要显示的图层列表（可选）
+        render_mode: 渲染模式 - "regions"(多个高密度区域) 或 "overview"(全图概览)
 
     Returns:
         Dict包含：
         - success: bool
-        - data: {image_paths: [str], image_count: int}
+        - data: {image_paths: [str], regions: [...], image_count: int}
         - error: str
     """
     try:
-        # TODO: 实现CAD转图片
-        # 1. 从数据库获取CAD文件
-        # 2. 使用matplotlib + ezdxf渲染
-        # 3. 保存图片到临时目录
-        # 4. 返回图片路径列表
+        from services.rendering_service import get_drawing_bounds
+        from services.cad_renderer import render_drawing_region
+
+        if not os.path.exists(file_path):
+            return {
+                "success": False,
+                "error": f"文件不存在: {file_path}"
+            }
+
+        # 步骤 1: 获取图纸边界和关键区域
+        bounds_result = get_drawing_bounds(file_path, layers=layers, grid_size=1000)
+
+        if not bounds_result["success"]:
+            return {
+                "success": False,
+                "error": f"获取图纸边界失败: {bounds_result['error']}"
+            }
+
+        image_paths = []
+        regions_info = []
+
+        if render_mode == "overview":
+            # 渲染全图概览
+            full_region = {
+                "x": bounds_result["bounds"]["min_x"],
+                "y": bounds_result["bounds"]["min_y"],
+                "width": bounds_result["bounds"]["width"],
+                "height": bounds_result["bounds"]["height"]
+            }
+
+            result = render_drawing_region(
+                file_path,
+                bbox=full_region,
+                output_size=(2048, 2048),
+                layers=layers
+            )
+
+            if result["success"]:
+                image_paths.append(result["image_path"])
+                regions_info.append({
+                    "name": "全图概览",
+                    "bbox": full_region,
+                    "image_path": result["image_path"]
+                })
+
+        else:  # render_mode == "regions"
+            # 渲染前5个高密度区域
+            regions = bounds_result["regions"][:5]
+
+            for i, region in enumerate(regions, 1):
+                result = render_drawing_region(
+                    file_path,
+                    bbox=region["bbox"],
+                    output_size=(2048, 2048),
+                    layers=layers
+                )
+
+                if result["success"]:
+                    image_paths.append(result["image_path"])
+                    regions_info.append({
+                        "name": region["name"],
+                        "bbox": region["bbox"],
+                        "entity_count": region["entity_count"],
+                        "image_path": result["image_path"]
+                    })
 
         return {
-            "success": False,
-            "error": "CAD转图片功能尚未实现"
+            "success": True,
+            "data": {
+                "image_paths": image_paths,
+                "regions": regions_info,
+                "image_count": len(image_paths),
+                "bounds": bounds_result["bounds"]
+            }
         }
 
     except Exception as e:
@@ -123,7 +194,7 @@ def analyze_drawing_visual(
                     ]
                 }
             ],
-            temperature=0.3,
+            temperature=1,  # Kimi 2.5 要求 temperature=1
         )
 
         analysis_text = response.choices[0].message.content

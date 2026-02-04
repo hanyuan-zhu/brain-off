@@ -7,14 +7,29 @@ from sqlalchemy import select, text
 
 from src.infrastructure.database.models import Skill
 from src.core.memory.embedding_service import EmbeddingService
+from src.core.skills.filesystem_skill_loader import FileSystemSkillLoader
 
 
 class SkillService:
     """技能管理服务"""
 
-    def __init__(self, db: AsyncSession):
+    def __init__(
+        self,
+        db: AsyncSession,
+        enable_filesystem: bool = True,
+        skills_path: str = "skills"
+    ):
         self.db = db
         self.embedding_service = EmbeddingService()
+        self.enable_filesystem = enable_filesystem
+
+        # Initialize filesystem loader if enabled
+        self.fs_loader = None
+        if enable_filesystem:
+            self.fs_loader = FileSystemSkillLoader(
+                skills_path=skills_path,
+                embedding_service=self.embedding_service
+            )
 
     async def retrieve_skills(
         self,
@@ -68,6 +83,7 @@ class SkillService:
     async def get_skill_by_id(self, skill_id: str) -> Optional[Skill]:
         """
         根据 ID 获取 skill
+        优先从文件系统加载，如果不存在则从数据库加载
 
         Args:
             skill_id: 技能 ID
@@ -75,6 +91,12 @@ class SkillService:
         Returns:
             Skill 对象，如果不存在则返回 None
         """
+        # Try filesystem first if enabled
+        if self.enable_filesystem and self.fs_loader:
+            if self.fs_loader.skill_exists(skill_id):
+                return self.fs_loader.load_skill(skill_id)
+
+        # Fallback to database
         result = await self.db.execute(
             select(Skill).where(Skill.id == skill_id)
         )
@@ -147,3 +169,15 @@ class SkillService:
         await self.db.refresh(skill)
 
         return skill
+
+    async def sync_filesystem_to_db(self) -> Dict[str, Any]:
+        """
+        将文件系统中的skills同步到数据库
+
+        Returns:
+            同步操作的摘要信息
+        """
+        if not self.enable_filesystem or not self.fs_loader:
+            return {"error": "Filesystem loading is not enabled"}
+
+        return self.fs_loader.sync_to_database(self.db)

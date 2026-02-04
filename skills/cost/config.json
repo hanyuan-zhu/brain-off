@@ -1,0 +1,44 @@
+{
+  "id": "cost",
+  "name": "工程造价分析",
+  "version": "1.0.0",
+  "description": "专业的建筑CAD图纸分析和工程量清单生成工具",
+  "tools": [
+    "get_cad_metadata",
+    "get_cad_regions",
+    "render_cad_region",
+    "extract_cad_entities",
+    "convert_dwg_to_dxf",
+    "list_files",
+    "read_file",
+    "write_file",
+    "append_to_file"
+  ],
+  "model": {
+    "provider": "moonshot",
+    "model_name": "moonshot-v1-128k",
+    "temperature": 0.3,
+    "max_tokens": 8000
+  },
+  "enabled": true,
+  "workspace": {
+    "working_directory": "workspace/cost",
+    "shared_directory": "workspace/shared",
+    "subdirs": {
+      "projects": "projects",
+      "cad_files": "cad_files",
+      "rendered": "rendered",
+      "notes": "notes"
+    }
+  },
+  "metadata": {
+    "author": "System",
+    "created_at": "2026-02-04",
+    "tags": ["cad", "construction", "cost-estimation", "bim"],
+    "requires_vision": true,
+    "env_vars": [
+      "VISION_MODEL_API_KEY",
+      "VISION_MODEL_BASE_URL"
+    ]
+  }
+}

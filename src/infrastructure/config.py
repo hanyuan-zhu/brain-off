@@ -40,6 +40,16 @@ class Settings(BaseSettings):
         alias="DASHSCOPE_EMBEDDING_MODEL"
     )
 
+    # Cost Skill - Vision Model API (Optional)
+    vision_model_api_key: Optional[str] = Field(
+        default=None,
+        alias="VISION_MODEL_API_KEY"
+    )
+    vision_model_base_url: str = Field(
+        default="https://api.moonshot.cn/v1",
+        alias="VISION_MODEL_BASE_URL"
+    )
+
     class Config:
         env_file = ".env"
         case_sensitive = False
