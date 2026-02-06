@@ -14,7 +14,5 @@ prompt: |
   请根据用户的需求调用相应的工具。
 
 tools:
-  - create_todo
-  - list_todos
-  - update_todo
-  - delete_todo
+  - database_operation
+  - search

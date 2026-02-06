@@ -1,0 +1,45 @@
+{
+  "id": "todo",
+  "name": "Todo 任务管理",
+  "version": "1.0.0",
+  "description": "帮助用户管理待办事项，包括添加、查看、完成和删除任务",
+  "tools": [
+    "database_operation",
+    "search"
+  ],
+  "model": {
+    "provider": "deepseek",
+    "model_name": "deepseek-chat",
+    "temperature": 0.7,
+    "max_tokens": 4000
+  },
+  "enabled": true,
+  "metadata": {
+    "author": "System",
+    "requires_vision": false
+  },
+  "visualizations": {
+    "database_operation": {
+      "create_task": {
+        "calling": "【创建任务卡：\"{title}\"】",
+        "success": "【✓ 任务已创建】",
+        "error": "【✗ 创建失败：{error}】"
+      },
+      "update_task": {
+        "calling": "【更新任务】",
+        "success": "【✓ 已更新：\"{title}\"】",
+        "error": "【✗ 更新失败：{error}】"
+      },
+      "delete_task": {
+        "calling": "【删除任务】",
+        "success": "【✓ 已删除：\"{title}\"】",
+        "error": "【✗ 删除失败：{error}】"
+      }
+    },
+    "search": {
+      "calling": "【正在搜索 \"{query}\"】",
+      "success": "【找到 {count} 个结果】",
+      "error": "【✗ 搜索失败：{error}】"
+    }
+  }
+}

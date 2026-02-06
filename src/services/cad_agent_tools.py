@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Kimi Agent 工具定义
+CAD Agent 工具定义
 
-为 Kimi 2.5 Agent 提供 CAD 分析工具，让其能够：
+为 CAD skills 提供分析工具，让其能够：
 1. 获取 CAD 全局概览（元数据 + 全图缩略图）
 2. 检查指定区域（高清图 + 实体数据）
 3. 提取 CAD 结构化数据（图层、实体、尺寸等）
@@ -16,6 +16,29 @@ import json
 # ============================================================
 # 工具函数定义
 # ============================================================
+
+
+def _encode_image_preview_base64(
+    image_path: str,
+    max_side: int = 768,
+    jpeg_quality: int = 60,
+) -> Optional[str]:
+    """
+    Encode a compact JPEG preview to keep tool payload token-friendly.
+    """
+    try:
+        import base64
+        import io
+        from PIL import Image
+
+        with Image.open(image_path) as image:
+            image = image.convert("RGB")
+            image.thumbnail((max_side, max_side))
+            buffer = io.BytesIO()
+            image.save(buffer, format="JPEG", quality=jpeg_quality, optimize=True)
+            return base64.b64encode(buffer.getvalue()).decode("utf-8")
+    except Exception:
+        return None
 
 def get_cad_metadata(file_path: str) -> Dict[str, Any]:
     """
@@ -32,99 +55,77 @@ def get_cad_metadata(file_path: str) -> Dict[str, Any]:
     """
     try:
         import os
-        import ezdxf
         from pathlib import Path
-        from ezdxf.bbox import extents
+        import ezdxf
+        from .cad_renderer import get_renderable_bounds, render_drawing_region
 
         if not os.path.exists(file_path):
-            return {
-                "success": False,
-                "error": f"文件不存在: {file_path}"
-            }
+            return {"success": False, "error": f"文件不存在: {file_path}"}
 
-        # 读取 DXF 文件
         doc = ezdxf.readfile(file_path)
         msp = doc.modelspace()
 
         # 提取图层信息
         layers_info = {}
+        total_entities = 0
         for entity in msp:
-            layer_name = entity.dxf.layer
+            total_entities += 1
+            layer_name = getattr(entity.dxf, "layer", "0")
             if layer_name not in layers_info:
-                layers_info[layer_name] = {
-                    "entity_count": 0,
-                    "entity_types": {}
-                }
+                layers_info[layer_name] = {"entity_count": 0, "entity_types": {}}
             layers_info[layer_name]["entity_count"] += 1
 
             entity_type = entity.dxftype()
-            if entity_type not in layers_info[layer_name]["entity_types"]:
-                layers_info[layer_name]["entity_types"][entity_type] = 0
-            layers_info[layer_name]["entity_types"][entity_type] += 1
+            layers_info[layer_name]["entity_types"][entity_type] = (
+                layers_info[layer_name]["entity_types"].get(entity_type, 0) + 1
+            )
 
-        # 获取边界信息
-        try:
-            bbox = extents(msp)
-            bounds = {
-                "min_x": round(bbox.extmin.x, 2),
-                "max_x": round(bbox.extmax.x, 2),
-                "min_y": round(bbox.extmin.y, 2),
-                "max_y": round(bbox.extmax.y, 2),
-                "width": round(bbox.size.x, 2),
-                "height": round(bbox.size.y, 2),
-                "width_m": round(bbox.size.x / 1000, 2),
-                "height_m": round(bbox.size.y / 1000, 2)
-            }
-        except:
-            bounds = None
-
-        # 获取文件元数据
-        filename = Path(file_path).name
-        file_size = os.path.getsize(file_path)
+        bounds_result = get_renderable_bounds(file_path)
+        bounds = bounds_result["bounds"] if bounds_result.get("success") else None
 
         result = {
             "success": True,
             "data": {
-                "filename": filename,
+                "filename": Path(file_path).name,
                 "file_path": file_path,
                 "metadata": {
                     "dxf_version": doc.dxfversion,
-                    "file_size": file_size,
-                    "units": str(doc.units)
+                    "file_size": os.path.getsize(file_path),
+                    "units": str(doc.units),
                 },
                 "bounds": bounds,
                 "layers": layers_info,
-                "entity_count": len(list(msp)),
-                "layer_count": len(layers_info)
-            }
+                "entity_count": total_entities,
+                "layer_count": len(layers_info),
+            },
         }
 
-        # 生成全局缩略图
-        if bounds:
-            from .cad_renderer import render_drawing_region
+        if bounds_result.get("success"):
+            result["data"]["bounds_source"] = "renderable_entities"
+            result["data"]["bounds_quality"] = {
+                "raw_entity_count": bounds_result.get("raw_entity_count", 0),
+                "used_entity_count": bounds_result.get("used_entity_count", 0),
+            }
 
+        if bounds:
             thumbnail_result = render_drawing_region(
                 file_path,
                 bbox={
                     "x": bounds["min_x"],
                     "y": bounds["min_y"],
                     "width": bounds["width"],
-                    "height": bounds["height"]
+                    "height": bounds["height"],
                 },
                 output_size=(800, 800),
-                color_mode="by_layer"
+                color_mode="by_layer",
             )
-
-            if thumbnail_result["success"]:
+            if thumbnail_result.get("success"):
                 result["data"]["thumbnail"] = thumbnail_result["image_path"]
 
         return result
 
     except Exception as e:
-        return {
-            "success": False,
-            "error": f"获取元数据失败: {str(e)}"
-        }
+        return {"success": False, "error": f"获取元数据失败: {str(e)}"}
 
 
 def extract_cad_entities(
@@ -147,6 +148,18 @@ def extract_cad_entities(
     """
     try:
         import ezdxf
+        from ezdxf.tools.text import plain_mtext
+        from .cad_renderer import decode_cad_text, entity_intersects_bbox
+
+        def iter_entities(msp):
+            for entity in msp:
+                if entity.dxftype() == "INSERT":
+                    try:
+                        for sub_entity in entity.virtual_entities():
+                            yield sub_entity
+                    except Exception:
+                        pass
+                yield entity
 
         doc = ezdxf.readfile(file_path)
         msp = doc.modelspace()
@@ -154,82 +167,44 @@ def extract_cad_entities(
         entities = []
         entity_count = {}
 
-        # 辅助函数：检查点是否在 bbox 内
-        def is_in_bbox(x, y, bbox):
-            if not bbox:
-                return True
-            return (bbox['x'] <= x <= bbox['x'] + bbox['width'] and
-                    bbox['y'] <= y <= bbox['y'] + bbox['height'])
+        for entity in iter_entities(msp):
+            entity_type = entity.dxftype()
 
-        for entity in msp:
-            # 过滤实体类型
-            if entity_types and entity.dxftype() not in entity_types:
+            if entity_types and entity_type not in entity_types:
                 continue
 
-            # 过滤图层
-            if layers and entity.dxf.layer not in layers:
+            layer_name = getattr(entity.dxf, "layer", "0")
+            if layers and layer_name not in layers:
                 continue
 
-            # 过滤 bbox（检查实体是否在指定区域内）
-            if bbox:
-                in_region = False
-                try:
-                    if entity.dxftype() == "LINE":
-                        # 线段：起点或终点在区域内
-                        if (is_in_bbox(entity.dxf.start.x, entity.dxf.start.y, bbox) or
-                            is_in_bbox(entity.dxf.end.x, entity.dxf.end.y, bbox)):
-                            in_region = True
-                    elif entity.dxftype() == "CIRCLE":
-                        # 圆：圆心在区域内
-                        if is_in_bbox(entity.dxf.center.x, entity.dxf.center.y, bbox):
-                            in_region = True
-                    elif entity.dxftype() == "TEXT":
-                        # 文字：插入点在区域内
-                        if is_in_bbox(entity.dxf.insert.x, entity.dxf.insert.y, bbox):
-                            in_region = True
-                    elif hasattr(entity.dxf, 'start'):
-                        # 其他有起点的实体
-                        if is_in_bbox(entity.dxf.start.x, entity.dxf.start.y, bbox):
-                            in_region = True
-                    elif hasattr(entity.dxf, 'center'):
-                        # 其他有中心点的实体
-                        if is_in_bbox(entity.dxf.center.x, entity.dxf.center.y, bbox):
-                            in_region = True
-                    elif hasattr(entity.dxf, 'insert'):
-                        # 其他有插入点的实体
-                        if is_in_bbox(entity.dxf.insert.x, entity.dxf.insert.y, bbox):
-                            in_region = True
-                except:
-                    pass
+            if bbox and not entity_intersects_bbox(entity, bbox):
+                continue
 
-                if not in_region:
-                    continue
-
-            # 提取实体信息
             entity_info = {
-                "type": entity.dxftype(),
-                "layer": entity.dxf.layer,
-                "color": entity.dxf.color
+                "type": entity_type,
+                "layer": layer_name,
+                "color": getattr(entity.dxf, "color", None),
             }
 
-            # 提取几何信息
-            if entity.dxftype() == "LINE":
-                entity_info["start"] = [entity.dxf.start.x, entity.dxf.start.y]
-                entity_info["end"] = [entity.dxf.end.x, entity.dxf.end.y]
-
-            elif entity.dxftype() == "CIRCLE":
-                entity_info["center"] = [entity.dxf.center.x, entity.dxf.center.y]
-                entity_info["radius"] = entity.dxf.radius
-
-            elif entity.dxftype() == "TEXT":
-                entity_info["text"] = entity.dxf.text
-                entity_info["position"] = [entity.dxf.insert.x, entity.dxf.insert.y]
-                entity_info["height"] = entity.dxf.height
+            try:
+                if entity_type == "LINE":
+                    entity_info["start"] = [entity.dxf.start.x, entity.dxf.start.y]
+                    entity_info["end"] = [entity.dxf.end.x, entity.dxf.end.y]
+                elif entity_type == "CIRCLE":
+                    entity_info["center"] = [entity.dxf.center.x, entity.dxf.center.y]
+                    entity_info["radius"] = entity.dxf.radius
+                elif entity_type == "TEXT":
+                    entity_info["text"] = decode_cad_text(entity.dxf.text)
+                    entity_info["position"] = [entity.dxf.insert.x, entity.dxf.insert.y]
+                    entity_info["height"] = getattr(entity.dxf, "height", None)
+                elif entity_type == "MTEXT":
+                    entity_info["text"] = decode_cad_text(plain_mtext(entity.text))
+                    entity_info["position"] = [entity.dxf.insert.x, entity.dxf.insert.y]
+                    entity_info["height"] = getattr(entity.dxf, "char_height", None)
+            except Exception:
+                pass
 
             entities.append(entity_info)
-
-            # 统计
-            entity_type = entity.dxftype()
             entity_count[entity_type] = entity_count.get(entity_type, 0) + 1
 
         return {
@@ -237,15 +212,12 @@ def extract_cad_entities(
             "data": {
                 "entities": entities[:100],  # 只返回前100个
                 "total_count": len(entities),
-                "entity_count": entity_count
-            }
+                "entity_count": entity_count,
+            },
         }
 
     except Exception as e:
-        return {
-            "success": False,
-            "error": f"提取实体失败: {str(e)}"
-        }
+        return {"success": False, "error": f"提取实体失败: {str(e)}"}
 
 
 def inspect_region(
@@ -254,7 +226,8 @@ def inspect_region(
     y: float,
     width: float,
     height: float,
-    output_size: int = 2048
+    output_size: int = 2048,
+    include_image_base64: bool = False,
 ) -> Dict[str, Any]:
     """
     检查指定区域 - 一次调用同时获取图片和数据
@@ -294,126 +267,97 @@ def inspect_region(
         }
     """
     try:
-        from .cad_renderer import render_drawing_region
         import ezdxf
-        import base64
+        from ezdxf.tools.text import plain_mtext
+        from .cad_renderer import decode_cad_text, entity_intersects_bbox, render_drawing_region
+
+        if width <= 0 or height <= 0:
+            return {"success": False, "error": f"无效区域尺寸: width={width}, height={height}"}
 
         bbox = {"x": x, "y": y, "width": width, "height": height}
 
-        # 1. 渲染图片
         render_result = render_drawing_region(
             file_path,
             bbox=bbox,
-            output_size=(output_size, output_size)
+            output_size=(output_size, output_size),
         )
-
-        if not render_result["success"]:
-            return {
-                "success": False,
-                "error": f"渲染失败: {render_result['error']}"
-            }
+        if not render_result.get("success"):
+            return {"success": False, "error": f"渲染失败: {render_result['error']}"}
 
         image_path = render_result["image_path"]
 
-        # 2. 编码图片为 base64（让 AI 能看到）
-        try:
-            with open(image_path, "rb") as f:
-                image_base64 = base64.b64encode(f.read()).decode('utf-8')
-        except Exception as e:
-            image_base64 = None
+        image_base64 = _encode_image_preview_base64(image_path) if include_image_base64 else None
 
-        # 3. 提取区域内的实体数据
         doc = ezdxf.readfile(file_path)
         msp = doc.modelspace()
+
+        def iter_entities():
+            for entity in msp:
+                if entity.dxftype() == "INSERT":
+                    try:
+                        for sub_entity in entity.virtual_entities():
+                            yield sub_entity
+                    except Exception:
+                        pass
+                yield entity
 
         entities_by_type = {}
         entities_by_layer = {}
         texts = []
-        dimensions = []
 
-        def is_in_bbox(px, py):
-            return (x <= px <= x + width and y <= py <= y + height)
-
-        for entity in msp:
-            # 检查实体是否在区域内
-            in_region = False
-            entity_point = None
-
-            try:
-                if entity.dxftype() == "LINE":
-                    if (is_in_bbox(entity.dxf.start.x, entity.dxf.start.y) or
-                        is_in_bbox(entity.dxf.end.x, entity.dxf.end.y)):
-                        in_region = True
-                elif entity.dxftype() == "TEXT":
-                    if is_in_bbox(entity.dxf.insert.x, entity.dxf.insert.y):
-                        in_region = True
-                        texts.append({
-                            "text": entity.dxf.text,
-                            "position": [entity.dxf.insert.x, entity.dxf.insert.y],
-                            "height": entity.dxf.height,
-                            "layer": entity.dxf.layer
-                        })
-                elif entity.dxftype() == "MTEXT":
-                    if is_in_bbox(entity.dxf.insert.x, entity.dxf.insert.y):
-                        in_region = True
-                        texts.append({
-                            "text": entity.text,
-                            "position": [entity.dxf.insert.x, entity.dxf.insert.y],
-                            "layer": entity.dxf.layer
-                        })
-                elif hasattr(entity.dxf, 'center'):
-                    if is_in_bbox(entity.dxf.center.x, entity.dxf.center.y):
-                        in_region = True
-                elif hasattr(entity.dxf, 'start'):
-                    if is_in_bbox(entity.dxf.start.x, entity.dxf.start.y):
-                        in_region = True
-                elif hasattr(entity.dxf, 'insert'):
-                    if is_in_bbox(entity.dxf.insert.x, entity.dxf.insert.y):
-                        in_region = True
-            except:
-                pass
-
-            if not in_region:
+        for entity in iter_entities():
+            if not entity_intersects_bbox(entity, bbox):
                 continue
 
-            # 统计实体类型
             entity_type = entity.dxftype()
+            layer_name = getattr(entity.dxf, "layer", "0")
             entities_by_type[entity_type] = entities_by_type.get(entity_type, 0) + 1
+            entities_by_layer[layer_name] = entities_by_layer.get(layer_name, 0) + 1
 
-            # 统计图层
-            layer = entity.dxf.layer
-            entities_by_layer[layer] = entities_by_layer.get(layer, 0) + 1
+            try:
+                if entity_type == "TEXT":
+                    texts.append({
+                        "text": decode_cad_text(entity.dxf.text),
+                        "position": [entity.dxf.insert.x, entity.dxf.insert.y],
+                        "height": getattr(entity.dxf, "height", None),
+                        "layer": layer_name,
+                    })
+                elif entity_type == "MTEXT":
+                    texts.append({
+                        "text": decode_cad_text(plain_mtext(entity.text)),
+                        "position": [entity.dxf.insert.x, entity.dxf.insert.y],
+                        "height": getattr(entity.dxf, "char_height", None),
+                        "layer": layer_name,
+                    })
+            except Exception:
+                pass
 
-        # 计算区域面积
-        area_m2 = round((width * height) / 1000000, 2)
+        area_m2 = round((width * height) / 1_000_000, 2)
 
         return {
             "success": True,
             "data": {
                 "image_path": image_path,
-                "image_base64": image_base64,
+                "image_base64": image_base64,  # Optional compact preview for direct vision calls.
                 "region_info": {
                     "bbox": bbox,
                     "area_m2": area_m2,
-                    "scale": render_result.get("scale")
+                    "scale": render_result.get("scale"),
                 },
                 "entity_summary": {
                     "total_count": sum(entities_by_type.values()),
                     "by_type": entities_by_type,
-                    "by_layer": entities_by_layer
+                    "by_layer": entities_by_layer,
                 },
                 "key_content": {
                     "texts": texts[:50],  # 最多返回 50 个文字
-                    "text_count": len(texts)
-                }
-            }
+                    "text_count": len(texts),
+                },
+            },
         }
 
     except Exception as e:
-        return {
-            "success": False,
-            "error": f"检查区域失败: {str(e)}"
-        }
+        return {"success": False, "error": f"检查区域失败: {str(e)}"}
 
 
 def list_files(working_folder: str, recursive: bool = False) -> Dict[str, Any]:
@@ -660,10 +604,10 @@ def convert_dwg_to_dxf(dwg_path: str, output_path: Optional[str] = None, delete_
 
 
 # ============================================================
-# 工具定义 Schema（供 Kimi Agent 使用）
+# 工具定义 Schema（供 CAD skills 使用）
 # ============================================================
 
-KIMI_AGENT_TOOLS = [
+CAD_AGENT_TOOLS = [
     {
         "type": "function",
         "function": {
@@ -713,6 +657,11 @@ KIMI_AGENT_TOOLS = [
                         "type": "integer",
                         "description": "输出图片尺寸（像素），默认2048",
                         "default": 2048
+                    },
+                    "include_image_base64": {
+                        "type": "boolean",
+                        "description": "是否返回压缩后的 base64 预览图（默认 false）。开启会增加 token 消耗。",
+                        "default": False
                     }
                 },
                 "required": ["file_path", "x", "y", "width", "height"]

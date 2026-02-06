@@ -112,10 +112,10 @@ def get_drawing_bounds(
             "total_entities": len(entity_positions)
         }
 
-    except ImportError:
+    except ImportError as e:
         return {
             "success": False,
-            "error": "需要安装 ezdxf 库。请运行: pip install ezdxf"
+            "error": f"依赖导入失败: {str(e)}"
         }
     except Exception as e:
         return {
@@ -277,7 +277,7 @@ def _identify_key_regions(
         return [_create_full_region(entity_positions, bounds)]
 
     # 步骤 4: 聚类相邻网格
-    from services.region_utils import cluster_grids
+    from .region_utils import cluster_grids
     regions = cluster_grids(high_density_grids, grid_size)
 
     # 步骤 5: 按密度排序

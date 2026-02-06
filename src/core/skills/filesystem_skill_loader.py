@@ -29,6 +29,7 @@ class SkillConfig:
     enabled: bool = True
     workspace: Optional[Dict[str, Any]] = None
     metadata: Optional[Dict[str, Any]] = None
+    visualizations: Optional[Dict[str, Any]] = None
 
 
 class FileSystemSkillLoader:

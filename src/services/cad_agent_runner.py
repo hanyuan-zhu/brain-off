@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Kimi Agent - CAD 图纸分析 Agent
+CAD Agent Runner - CAD 图纸分析 Agent
 
-让 Kimi 2.5 作为 Agent 主动调用工具：
+让 CAD Agent 主动调用工具：
 1. 先用 ezdxf 提取结构化数据作为上下文
 2. 自己决定要渲染哪些区域
 3. 结合结构化数据和视觉分析得出结论
@@ -10,7 +10,6 @@ Kimi Agent - CAD 图纸分析 Agent
 
 import os
 import json
-import base64
 from typing import Dict, Any, List, Optional
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -19,17 +18,16 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # 导入工具函数
-from services.kimi_agent_tools import (
+from services.cad_agent_tools import (
     get_cad_metadata,
-    get_cad_regions,
-    render_cad_region,
+    inspect_region,
     extract_cad_entities,
     list_files,
     read_file,
     write_file,
     append_to_file,
     convert_dwg_to_dxf,
-    KIMI_AGENT_TOOLS
+    CAD_AGENT_TOOLS,
 )
 
 # 初始化 Kimi 客户端
@@ -51,11 +49,10 @@ def execute_tool_call(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, An
         if tool_name == "get_cad_metadata":
             return get_cad_metadata(**arguments)
 
-        elif tool_name == "get_cad_regions":
-            return get_cad_regions(**arguments)
-
-        elif tool_name == "render_cad_region":
-            return render_cad_region(**arguments)
+        elif tool_name == "inspect_region":
+            call_args = dict(arguments)
+            call_args.setdefault("include_image_base64", True)
+            return inspect_region(**call_args)
 
         elif tool_name == "extract_cad_entities":
             return extract_cad_entities(**arguments)
@@ -87,24 +84,17 @@ def execute_tool_call(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, An
             "error": f"工具执行失败: {str(e)}"
         }
 
-
-def encode_image_to_base64(image_path: str) -> str:
-    """将图片编码为 base64"""
-    with open(image_path, "rb") as f:
-        return base64.b64encode(f.read()).decode('utf-8')
-
-
 # ============================================================
-# Kimi Agent 核心函数
+# CAD Agent 核心函数
 # ============================================================
 
-def run_kimi_agent(
+def run_cad_agent(
     file_path: str,
     task: str,
     max_iterations: int = 10
 ) -> Dict[str, Any]:
     """
-    运行 Kimi Agent 分析 CAD 文件
+    运行 CAD Agent 分析 CAD 文件
 
     Args:
         file_path: CAD 文件路径
@@ -122,15 +112,13 @@ def run_kimi_agent(
                 "content": """你是一个专业的建筑工程图纸分析助手。你可以使用以下工具来分析CAD图纸：
 
 1. get_cad_metadata - 获取CAD文件元数据（图层、实体统计等）
-2. get_cad_regions - 识别图纸中的关键区域
-3. render_cad_region - 渲染指定区域为图片
-4. extract_cad_entities - 提取实体的结构化数据
+2. inspect_region - 检查指定区域（图片+结构化数据）
+3. extract_cad_entities - 提取实体的结构化数据
 
 分析策略：
 1. 先调用 get_cad_metadata 了解图纸基本信息
-2. 调用 get_cad_regions 识别关键区域
-3. 根据需要调用 render_cad_region 渲染感兴趣的区域
-4. 结合结构化数据和视觉分析给出结论
+2. 根据需要调用 inspect_region 检查感兴趣区域
+3. 结合结构化数据和视觉分析给出结论
 
 请主动思考需要"看"哪些区域，然后调用工具获取信息。"""
             },
@@ -150,11 +138,11 @@ def run_kimi_agent(
             print(f"迭代 {iteration}/{max_iterations}")
             print(f"{'='*60}")
             
-            # 调用 Kimi API
+            # 调用 LLM API
             response = client.chat.completions.create(
                 model=MODEL_NAME,
                 messages=messages,
-                tools=KIMI_AGENT_TOOLS,
+                tools=CAD_AGENT_TOOLS,
                 temperature=1
             )
             
@@ -195,20 +183,23 @@ def run_kimi_agent(
                 })
                 
                 # 如果是渲染工具，需要将图片编码为 base64
-                if tool_name == "render_cad_region" and result.get("success"):
+                if tool_name == "inspect_region" and result.get("success"):
                     image_path = result["data"]["image_path"]
-                    image_base64 = encode_image_to_base64(image_path)
+                    image_base64 = result["data"].get("image_base64")
                     
                     # 添加图片到消息
+                    payload = {
+                        "success": True,
+                        "image_path": image_path,
+                        "scale": result["data"]["scale"]
+                    }
+                    if image_base64:
+                        payload["image_base64"] = image_base64
+
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call.id,
-                        "content": json.dumps({
-                            "success": True,
-                            "image_base64": image_base64,
-                            "image_path": image_path,
-                            "scale": result["data"]["scale"]
-                        }, ensure_ascii=False)
+                        "content": json.dumps(payload, ensure_ascii=False)
                     })
                     
                     print(f"✅ 渲染成功: {image_path}")

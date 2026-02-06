@@ -41,6 +41,8 @@ class MemoryDrivenAgent:
         self.db = db
         self.session_manager = get_session_manager()
         self.max_iterations = 20
+        # Keep tool payloads compact before sending back to LLM to avoid token overflow.
+        self.max_tool_result_chars = 40000
         self.fixed_skill_id = fixed_skill_id
         self.use_reasoner = use_reasoner
 
@@ -545,19 +547,7 @@ class MemoryDrivenAgent:
                 db=self.db,
                 **arguments
             )
-
-            # 特殊处理：如果是渲染工具，将图片编码为base64让AI能看到
-            if function_name == "render_cad_region" and result.get("success"):
-                image_path = result.get("data", {}).get("image_path")
-                if image_path:
-                    try:
-                        import base64
-                        with open(image_path, "rb") as f:
-                            image_base64 = base64.b64encode(f.read()).decode('utf-8')
-                        result["data"]["image_base64"] = image_base64
-                        debug_print(f"[Agent] 已将图片编码为base64: {image_path}")
-                    except Exception as e:
-                        debug_print(f"[Agent] 图片编码失败: {e}")
+            result = self._sanitize_tool_result(function_name, result)
 
             # 输出工具结果可视化
             if stream_callback:
@@ -579,3 +569,89 @@ class MemoryDrivenAgent:
 
         return results
 
+    def _sanitize_tool_result(self, tool_name: str, result: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Trim oversized tool payloads before they are appended into chat history.
+        """
+        if not isinstance(result, dict):
+            return {"success": False, "error": f"工具 {tool_name} 返回了无效结果格式"}
+
+        safe = dict(result)
+        data = safe.get("data")
+        if isinstance(data, dict):
+            safe_data = dict(data)
+
+            image_base64 = safe_data.get("image_base64")
+            if isinstance(image_base64, str) and image_base64:
+                safe_data.pop("image_base64", None)
+                safe_data["image_base64_omitted"] = True
+                safe_data["image_base64_chars"] = len(image_base64)
+
+            key_content = safe_data.get("key_content")
+            if isinstance(key_content, dict):
+                texts = key_content.get("texts")
+                if isinstance(texts, list) and len(texts) > 20:
+                    safe_key_content = dict(key_content)
+                    safe_key_content["texts"] = texts[:20]
+                    safe_key_content["texts_truncated"] = len(texts) - 20
+                    safe_data["key_content"] = safe_key_content
+
+            safe["data"] = safe_data
+
+        try:
+            serialized = json.dumps(safe, ensure_ascii=False)
+        except Exception:
+            return {
+                "success": bool(result.get("success")),
+                "error": result.get("error", f"工具 {tool_name} 结果序列化失败"),
+            }
+
+        if len(serialized) <= self.max_tool_result_chars:
+            return safe
+
+        compact_data = {}
+        if isinstance(safe.get("data"), dict):
+            src = safe["data"]
+            for key in (
+                "image_path",
+                "region_info",
+                "entity_summary",
+                "key_content",
+                "bounds",
+                "filename",
+                "entity_count",
+                "total_count",
+                "layer_count",
+                "image_base64_omitted",
+                "image_base64_chars",
+            ):
+                if key in src:
+                    compact_data[key] = src[key]
+
+        compact = {
+            "success": bool(safe.get("success")),
+            "_truncated": True,
+            "_original_chars": len(serialized),
+        }
+        if "error" in safe:
+            compact["error"] = safe.get("error")
+        if compact_data:
+            compact["data"] = compact_data
+
+        compact_serialized = json.dumps(compact, ensure_ascii=False)
+        if len(compact_serialized) <= self.max_tool_result_chars:
+            return compact
+
+        minimal = {
+            "success": bool(safe.get("success")),
+            "_truncated": True,
+            "_original_chars": len(serialized),
+            "data": {
+                "note": f"tool result omitted due to size: {len(serialized)} chars",
+            },
+        }
+        if isinstance(safe.get("data"), dict) and safe["data"].get("image_path"):
+            minimal["data"]["image_path"] = safe["data"]["image_path"]
+        if "error" in safe:
+            minimal["error"] = safe.get("error")
+        return minimal
