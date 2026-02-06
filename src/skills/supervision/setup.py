@@ -7,18 +7,10 @@ import sys
 import os
 from pathlib import Path
 
-# 添加 skills-dev/supervision 到 Python 路径
-project_root = Path(__file__).parent.parent.parent.parent
-supervision_skill_path = project_root / "skills-dev" / "supervision"
-sys.path.insert(0, str(supervision_skill_path))
-
 from src.core.skills.tool_registry import get_tool_registry
 
-# 导入工具函数（从 skills-dev/cost/services 导入，因为是共享的）
-cost_skill_path = project_root / "skills-dev" / "cost"
-sys.path.insert(0, str(cost_skill_path))
-
-from services.kimi_agent_tools import (
+# 导入工具函数（从共享服务目录）
+from src.services.kimi_agent_tools import (
     get_cad_metadata,
     inspect_region,
     extract_cad_entities,

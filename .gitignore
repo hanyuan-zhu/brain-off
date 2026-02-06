@@ -28,3 +28,14 @@ Thumbs.db
 # Database
 *.db
 *.sqlite
+
+# Workspace and temporary files
+workspace/
+*.backup
+*_backup*
+*.bak
+*.tmp
+
+# Documentation drafts
+DIAGNOSIS.md
+USAGE.md

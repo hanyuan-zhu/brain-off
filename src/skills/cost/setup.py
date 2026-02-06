@@ -7,17 +7,10 @@ import sys
 import os
 from pathlib import Path
 
-# 添加 skills-dev/cost 到 Python 路径
-# __file__ 是 src/skills/cost/setup.py
-# parent.parent.parent 是项目根目录
-project_root = Path(__file__).parent.parent.parent.parent
-cost_skill_path = project_root / "skills-dev" / "cost"
-sys.path.insert(0, str(cost_skill_path))
-
 from src.core.skills.tool_registry import get_tool_registry
 
-# 导入 Kimi Agent 工具函数
-from services.kimi_agent_tools import (
+# 导入 Kimi Agent 工具函数（从共享服务目录）
+from src.services.kimi_agent_tools import (
     get_cad_metadata,
     inspect_region,
     extract_cad_entities,
