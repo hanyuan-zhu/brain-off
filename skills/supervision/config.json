@@ -40,5 +40,47 @@
       "VISION_MODEL_BASE_URL",
       "VISION_MODEL_NAME"
     ]
+  },
+  "visualizations": {
+    "get_cad_metadata": {
+      "calling": "获取CAD文件全局概览（边界、图层、实体统计）",
+      "success": "已获取CAD元数据",
+      "error": "获取CAD元数据失败"
+    },
+    "inspect_region": {
+      "calling": "检查区域 ({x}, {y}) 尺寸 {width}×{height}mm",
+      "success": "已检查区域（图片+数据）",
+      "error": "检查区域失败"
+    },
+    "extract_cad_entities": {
+      "calling": "提取CAD实体数据",
+      "success": "已提取实体数据",
+      "error": "提取实体失败"
+    },
+    "convert_dwg_to_dxf": {
+      "calling": "转换DWG文件为DXF格式",
+      "success": "已转换为DXF",
+      "error": "转换失败"
+    },
+    "list_files": {
+      "calling": "列出工作目录文件",
+      "success": "已列出文件",
+      "error": "列出文件失败"
+    },
+    "read_file": {
+      "calling": "读取文件 {filename}",
+      "success": "已读取文件",
+      "error": "读取文件失败"
+    },
+    "write_file": {
+      "calling": "写入文件 {filename}",
+      "success": "已写入文件",
+      "error": "写入文件失败"
+    },
+    "append_to_file": {
+      "calling": "追加内容到 {filename}",
+      "success": "已追加内容",
+      "error": "追加失败"
+    }
   }
 }
