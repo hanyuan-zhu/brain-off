@@ -11,6 +11,8 @@ CAD Agent 工具定义
 
 from typing import Dict, Any, List, Optional
 import json
+import contextlib
+import io
 
 
 # ============================================================
@@ -39,6 +41,24 @@ def _encode_image_preview_base64(
             return base64.b64encode(buffer.getvalue()).decode("utf-8")
     except Exception:
         return None
+
+
+@contextlib.contextmanager
+def _suppress_ezdxf_noise():
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        yield
+
+
+def _iter_entities_with_virtual(msp):
+    for entity in msp:
+        if entity.dxftype() == "INSERT":
+            try:
+                with _suppress_ezdxf_noise():
+                    for sub_entity in entity.virtual_entities():
+                        yield sub_entity
+            except Exception:
+                pass
+        yield entity
 
 def get_cad_metadata(file_path: str) -> Dict[str, Any]:
     """
@@ -151,23 +171,13 @@ def extract_cad_entities(
         from ezdxf.tools.text import plain_mtext
         from .cad_renderer import decode_cad_text, entity_intersects_bbox
 
-        def iter_entities(msp):
-            for entity in msp:
-                if entity.dxftype() == "INSERT":
-                    try:
-                        for sub_entity in entity.virtual_entities():
-                            yield sub_entity
-                    except Exception:
-                        pass
-                yield entity
-
         doc = ezdxf.readfile(file_path)
         msp = doc.modelspace()
 
         entities = []
         entity_count = {}
 
-        for entity in iter_entities(msp):
+        for entity in _iter_entities_with_virtual(msp):
             entity_type = entity.dxftype()
 
             if entity_types and entity_type not in entity_types:
@@ -291,21 +301,11 @@ def inspect_region(
         doc = ezdxf.readfile(file_path)
         msp = doc.modelspace()
 
-        def iter_entities():
-            for entity in msp:
-                if entity.dxftype() == "INSERT":
-                    try:
-                        for sub_entity in entity.virtual_entities():
-                            yield sub_entity
-                    except Exception:
-                        pass
-                yield entity
-
         entities_by_type = {}
         entities_by_layer = {}
         texts = []
 
-        for entity in iter_entities():
+        for entity in _iter_entities_with_virtual(msp):
             if not entity_intersects_bbox(entity, bbox):
                 continue
 

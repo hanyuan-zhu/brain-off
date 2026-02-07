@@ -11,6 +11,9 @@ from typing import Dict, Any, Optional, List
 from uuid import UUID
 import json
 import asyncio
+import copy
+from datetime import datetime
+from pathlib import Path
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -43,6 +46,12 @@ class MemoryDrivenAgent:
         self.max_iterations = 20
         # Keep tool payloads compact before sending back to LLM to avoid token overflow.
         self.max_tool_result_chars = 40000
+        # Soft budget hint per user turn to reduce accidental tool loops.
+        self.max_tool_calls_per_turn = 14
+        # Soft loop advisory: same tool+args repeated this many times will trigger a warning hint.
+        self.loop_review_repeat_threshold = 3
+        # Auto trace worklog path for detailed per-iteration execution record.
+        self.trace_log_path = Path("workspace/work_log_detailed.md")
         self.fixed_skill_id = fixed_skill_id
         self.use_reasoner = use_reasoner
 
@@ -280,6 +289,13 @@ class MemoryDrivenAgent:
             )
             tracker.end_sync_step("LLM生成响应")
 
+            trace_log_file = self._append_detailed_trace_log(
+                session_id=str(state.session_id),
+                user_message=user_message,
+                skill_id=filter_result.get("skill_id"),
+                loop_result=result,
+            )
+
             # 9. 【冗余挂载】存储对话到线上记忆（真正的异步，不阻塞返回）
             async def store_to_online_background():
                 """后台存储到线上记忆"""
@@ -318,6 +334,8 @@ class MemoryDrivenAgent:
                     "skill_id": filter_result["skill_id"],
                     "reasoning": filter_result.get("reasoning", ""),
                     "tool_calls": result.get("tool_calls", []),
+                    "loop_advisories": result.get("loop_advisories", []),
+                    "trace_log_path": trace_log_file,
                 }
             }
 
@@ -423,6 +441,13 @@ class MemoryDrivenAgent:
         iteration = 0
         accumulated_text = ""
         all_tool_calls = []
+        iteration_traces = []
+        loop_advisories = []
+        active_tools = tools
+        tool_cache: Dict[str, Dict[str, Any]] = {}
+        total_tool_calls = 0
+        tool_signature_counts: Dict[str, int] = {}
+        warned_signatures = set()
 
         while iteration < self.max_iterations:
             iteration += 1
@@ -430,7 +455,7 @@ class MemoryDrivenAgent:
             # 调用 LLM
             response = await self.llm_client.chat_completion(
                 messages=messages,
-                tools=tools,
+                tools=active_tools,
                 stream=False
             )
 
@@ -442,6 +467,17 @@ class MemoryDrivenAgent:
             # 提取响应内容
             content = response.choices[0].message.content or ""
             tool_calls = response.choices[0].message.tool_calls
+            reasoning_content = ""
+            if hasattr(response.choices[0].message, "reasoning_content") and response.choices[0].message.reasoning_content:
+                reasoning_content = response.choices[0].message.reasoning_content
+
+            iteration_trace = {
+                "iteration": iteration,
+                "assistant_plan": self._truncate_text(content, 1800),
+                "reasoning": self._truncate_text(reasoning_content, 1800),
+                "tool_calls": [],
+                "advisories": [],
+            }
 
             # 输出文本内容
             if content and stream_callback:
@@ -450,21 +486,64 @@ class MemoryDrivenAgent:
 
             # 如果没有工具调用，结束循环
             if not tool_calls:
+                iteration_trace["summary"] = "no tool calls; finalize response"
+                iteration_traces.append(iteration_trace)
                 state.add_message("assistant", content)
                 break
 
             # 处理工具调用
-            tool_results = await self._execute_tools(
+            tool_results, tool_exec_infos = await self._execute_tools(
                 tool_calls=tool_calls,
-                stream_callback=stream_callback
+                stream_callback=stream_callback,
+                tool_cache=tool_cache,
             )
 
             # 收集工具调用信息
-            for tool_call, result in zip(tool_calls, tool_results):
+            for tool_call, result, exec_info in zip(tool_calls, tool_results, tool_exec_infos):
+                try:
+                    parsed_args = json.loads(tool_call.function.arguments)
+                except Exception:
+                    parsed_args = {"_raw_arguments": tool_call.function.arguments}
+                signature = exec_info.get("signature")
+                if signature:
+                    tool_signature_counts[signature] = tool_signature_counts.get(signature, 0) + 1
+                    repeat_count = tool_signature_counts[signature]
+                    if repeat_count >= self.loop_review_repeat_threshold and signature not in warned_signatures:
+                        warned_signatures.add(signature)
+                        advisory = (
+                            f"loop-review hint: `{tool_call.function.name}` with same args repeated {repeat_count} times; "
+                            "double-check whether this is new evidence."
+                        )
+                        messages.append({
+                            "role": "system",
+                            "content": (
+                                f"你已经多次重复调用 `{tool_call.function.name}` 且参数相同。"
+                                "请自查是否真的有新增信息；如果没有，请停止重复调用并直接总结。"
+                            ),
+                        })
+                        loop_advisories.append({
+                            "iteration": iteration,
+                            "type": "repeat_signature",
+                            "message": advisory,
+                            "tool": tool_call.function.name,
+                            "signature": signature,
+                            "repeat_count": repeat_count,
+                        })
+                        iteration_trace["advisories"].append(advisory)
+
                 all_tool_calls.append({
                     "name": tool_call.function.name,
-                    "args": json.loads(tool_call.function.arguments),
-                    "result": result
+                    "args": parsed_args,
+                    "result": result,
+                    "cached": bool(exec_info.get("cached", False)),
+                    "signature": signature,
+                })
+                iteration_trace["tool_calls"].append({
+                    "name": tool_call.function.name,
+                    "args": parsed_args,
+                    "cached": bool(exec_info.get("cached", False)),
+                    "signature": signature,
+                    "result_summary": self._summarize_tool_result(tool_call.function.name, result),
                 })
 
             # 添加助手消息到消息列表
@@ -485,8 +564,8 @@ class MemoryDrivenAgent:
             }
 
             # 如果响应包含 reasoning_content（Kimi k2.5），保留它
-            if hasattr(response.choices[0].message, 'reasoning_content') and response.choices[0].message.reasoning_content:
-                assistant_message["reasoning_content"] = response.choices[0].message.reasoning_content
+            if reasoning_content:
+                assistant_message["reasoning_content"] = reasoning_content
 
             messages.append(assistant_message)
 
@@ -505,17 +584,82 @@ class MemoryDrivenAgent:
             for tool_call, result in zip(tool_calls, tool_results):
                 state.add_message("tool", json.dumps(result, ensure_ascii=False), tool_call_id=tool_call.id)
 
+            total_tool_calls += len(tool_calls)
+            if total_tool_calls >= self.max_tool_calls_per_turn:
+                advisory = (
+                    f"soft budget warning: total tool calls reached {total_tool_calls} "
+                    f"(configured max {self.max_tool_calls_per_turn})"
+                )
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        f"本轮工具调用已达到建议上限（{self.max_tool_calls_per_turn} 次）。"
+                        "请优先基于已有信息给出结论。若必须继续调用工具，请先说明新增价值。"
+                    ),
+                })
+                loop_advisories.append({
+                    "iteration": iteration,
+                    "type": "tool_budget_warning",
+                    "message": advisory,
+                    "total_tool_calls": total_tool_calls,
+                })
+                iteration_trace["advisories"].append(advisory)
+
+            iteration_trace["summary"] = self._build_iteration_summary(iteration_trace["tool_calls"])
+            iteration_traces.append(iteration_trace)
+
+        if iteration >= self.max_iterations:
+            messages.append({
+                "role": "system",
+                "content": (
+                    f"你已达到最大迭代次数（{self.max_iterations}）。"
+                    "请停止工具调用，直接给出基于已有证据的最终结论。"
+                ),
+            })
+            try:
+                final_response = await self.llm_client.chat_completion(
+                    messages=messages,
+                    tools=[],
+                    stream=False,
+                )
+                if final_response.choices and len(final_response.choices) > 0:
+                    final_content = final_response.choices[0].message.content or ""
+                    if final_content:
+                        if stream_callback:
+                            stream_callback('text', final_content)
+                        accumulated_text += final_content
+                        state.add_message("assistant", final_content)
+                        iteration_traces.append({
+                            "iteration": iteration + 1,
+                            "assistant_plan": self._truncate_text(final_content, 1800),
+                            "reasoning": "",
+                            "tool_calls": [],
+                            "advisories": [
+                                f"forced finalization after max iterations {self.max_iterations}"
+                            ],
+                            "summary": "forced final answer without tools",
+                        })
+            except Exception as e:
+                loop_advisories.append({
+                    "iteration": iteration,
+                    "type": "finalization_error",
+                    "message": f"failed to finalize after max iterations: {e}",
+                })
+
         return {
             "text": accumulated_text,
             "iterations": iteration,
-            "tool_calls": all_tool_calls
+            "tool_calls": all_tool_calls,
+            "iteration_traces": iteration_traces,
+            "loop_advisories": loop_advisories,
         }
 
     async def _execute_tools(
         self,
         tool_calls: List[Any],
-        stream_callback=None
-    ) -> List[Dict[str, Any]]:
+        stream_callback=None,
+        tool_cache: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """
         执行工具调用
 
@@ -524,13 +668,28 @@ class MemoryDrivenAgent:
             stream_callback: 流式输出回调
 
         Returns:
-            工具执行结果列表
+            (工具执行结果列表, 执行元信息列表)
         """
         results = []
+        execution_infos = []
 
         for tool_call in tool_calls:
             function_name = tool_call.function.name
-            arguments = json.loads(tool_call.function.arguments)
+            try:
+                arguments = json.loads(tool_call.function.arguments)
+            except Exception:
+                results.append({
+                    "success": False,
+                    "error": f"工具参数解析失败: {tool_call.function.arguments}",
+                })
+                execution_infos.append({
+                    "tool_name": function_name,
+                    "args": {"_raw_arguments": tool_call.function.arguments},
+                    "cached": False,
+                    "signature": None,
+                })
+                continue
+            signature = self._build_tool_signature(function_name, arguments)
 
             # 输出工具调用可视化
             if stream_callback:
@@ -541,13 +700,20 @@ class MemoryDrivenAgent:
                 )
                 stream_callback('tool_call', viz_text + '\n')
 
-            # 执行工具
-            result = await self.tool_registry.execute_tool(
-                tool_name=function_name,
-                db=self.db,
-                **arguments
-            )
-            result = self._sanitize_tool_result(function_name, result)
+            if tool_cache is not None and signature in tool_cache:
+                result = copy.deepcopy(tool_cache[signature])
+                cached = True
+            else:
+                # 执行工具
+                result = await self.tool_registry.execute_tool(
+                    tool_name=function_name,
+                    db=self.db,
+                    **arguments
+                )
+                result = self._sanitize_tool_result(function_name, result)
+                if tool_cache is not None:
+                    tool_cache[signature] = copy.deepcopy(result)
+                cached = False
 
             # 输出工具结果可视化
             if stream_callback:
@@ -566,17 +732,257 @@ class MemoryDrivenAgent:
                 stream_callback('tool_result', viz_text + '\n\n')
 
             results.append(result)
+            execution_infos.append({
+                "tool_name": function_name,
+                "args": arguments,
+                "cached": cached,
+                "signature": signature,
+            })
 
-        return results
+        return results, execution_infos
+
+    def _build_tool_signature(self, function_name: str, arguments: Dict[str, Any]) -> str:
+        canonical_arguments = json.dumps(arguments, ensure_ascii=False, sort_keys=True)
+        return f"{function_name}:{canonical_arguments}"
+
+    def _normalize_tool_result(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Normalize tool result envelopes to a single `{success, data|error}` shape.
+
+        Some legacy tools already return a wrapped structure and may get wrapped again
+        by the registry (`{"success": true, "data": {"success": ..., "data": ...}}`).
+        """
+        if not isinstance(result, dict):
+            return {"success": False, "error": "invalid tool result"}
+
+        normalized = dict(result)
+        data = normalized.get("data")
+
+        # Unwrap nested standard envelope.
+        if isinstance(data, dict) and "success" in data and ("data" in data or "error" in data):
+            outer_success = bool(normalized.get("success", True))
+            inner_success = bool(data.get("success"))
+            normalized["success"] = outer_success and inner_success
+            if "data" in data:
+                normalized["data"] = data.get("data")
+            else:
+                normalized.pop("data", None)
+            if data.get("error"):
+                normalized["error"] = data.get("error")
+            return normalized
+
+        # Handle legacy wrapped error payload: {"success": true, "data": {"error": "..."}}
+        if (
+            isinstance(data, dict)
+            and isinstance(data.get("error"), str)
+            and len(data) == 1
+            and bool(normalized.get("success", True))
+        ):
+            normalized["success"] = False
+            normalized["error"] = data["error"]
+            normalized.pop("data", None)
+
+        return normalized
+
+    def _truncate_text(self, text: str, max_chars: int = 1600) -> str:
+        if not text:
+            return ""
+        if len(text) <= max_chars:
+            return text
+        return text[:max_chars] + f"...(truncated {len(text) - max_chars} chars)"
+
+    def _summarize_tool_result(self, tool_name: str, result: Dict[str, Any]) -> Dict[str, Any]:
+        normalized = self._normalize_tool_result(result)
+        summary: Dict[str, Any] = {
+            "success": bool(normalized.get("success")),
+            "highlights": [],
+            "image_paths": [],
+        }
+        if normalized.get("error"):
+            summary["error"] = self._truncate_text(str(normalized.get("error")), 400)
+            return summary
+
+        data = normalized.get("data")
+        if not isinstance(data, dict):
+            return summary
+
+        image_path = data.get("image_path")
+        if isinstance(image_path, str) and image_path:
+            summary["image_paths"].append(image_path)
+            summary["highlights"].append(f"image: {image_path}")
+        thumbnail_path = data.get("thumbnail")
+        if isinstance(thumbnail_path, str) and thumbnail_path:
+            summary["image_paths"].append(thumbnail_path)
+            summary["highlights"].append(f"thumbnail: {thumbnail_path}")
+
+        if tool_name == "get_cad_metadata":
+            bounds = data.get("bounds") or {}
+            if isinstance(bounds, dict) and bounds.get("width") and bounds.get("height"):
+                summary["highlights"].append(
+                    f"bounds: ({bounds.get('min_x')}, {bounds.get('min_y')}) + {bounds.get('width')}x{bounds.get('height')}"
+                )
+            if isinstance(data.get("entity_count"), int):
+                summary["highlights"].append(f"entities: {data.get('entity_count')}")
+            if isinstance(data.get("layer_count"), int):
+                summary["highlights"].append(f"layers: {data.get('layer_count')}")
+
+        if tool_name == "inspect_region":
+            region_info = data.get("region_info") or {}
+            if isinstance(region_info, dict):
+                bbox = region_info.get("bbox") or {}
+                if isinstance(bbox, dict) and bbox.get("width") and bbox.get("height"):
+                    summary["highlights"].append(
+                        f"bbox: ({bbox.get('x')}, {bbox.get('y')}) + {bbox.get('width')}x{bbox.get('height')}"
+                    )
+            entity_summary = data.get("entity_summary") or {}
+            if isinstance(entity_summary, dict):
+                total = entity_summary.get("total_count")
+                if isinstance(total, int):
+                    summary["highlights"].append(f"entity_total: {total}")
+            key_content = data.get("key_content") or {}
+            if isinstance(key_content, dict):
+                text_count = key_content.get("text_count")
+                if isinstance(text_count, int):
+                    summary["highlights"].append(f"text_count: {text_count}")
+
+        if tool_name == "extract_cad_entities":
+            total = data.get("total_count")
+            if isinstance(total, int):
+                summary["highlights"].append(f"total_count: {total}")
+            entity_count = data.get("entity_count")
+            if isinstance(entity_count, dict) and entity_count:
+                keys = ",".join(list(entity_count.keys())[:6])
+                summary["highlights"].append(f"types: {keys}")
+
+        if tool_name in ("write_file", "append_to_file", "read_file", "list_files"):
+            for key in ("filename", "file_path", "line_count", "total_count"):
+                if key in data:
+                    summary["highlights"].append(f"{key}: {data[key]}")
+
+        return summary
+
+    def _build_iteration_summary(self, tool_entries: List[Dict[str, Any]]) -> str:
+        if not tool_entries:
+            return "no tool action"
+        highlights = []
+        for item in tool_entries:
+            name = item.get("name")
+            success = item.get("result_summary", {}).get("success")
+            cached = item.get("cached")
+            marker = "ok" if success else "err"
+            cache_tag = ",cached" if cached else ""
+            highlights.append(f"{name}({marker}{cache_tag})")
+        return " -> ".join(highlights)
+
+    def _to_workspace_markdown_path(self, path_str: str) -> str:
+        if not path_str:
+            return ""
+        path = str(path_str).replace("\\", "/")
+        if path.startswith("./"):
+            return path
+        workspace_marker = "workspace/"
+        marker_idx = path.find(workspace_marker)
+        if marker_idx >= 0:
+            return "./" + path[marker_idx + len(workspace_marker):]
+        return path
+
+    def _append_detailed_trace_log(
+        self,
+        session_id: str,
+        user_message: str,
+        skill_id: Optional[str],
+        loop_result: Dict[str, Any],
+    ) -> Optional[str]:
+        """
+        Write a detailed markdown trace log for each turn.
+        """
+        try:
+            log_path = self.trace_log_path
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            lines: List[str] = []
+            lines.append(f"## {timestamp} | session `{session_id[:8]}` | skill `{skill_id or 'auto'}`")
+            lines.append("")
+            lines.append("### User Prompt")
+            lines.append(self._truncate_text(user_message, 2000))
+            lines.append("")
+
+            advisories = loop_result.get("loop_advisories", [])
+            if advisories:
+                lines.append("### Loop Review Hints")
+                for item in advisories:
+                    lines.append(f"- [iter {item.get('iteration')}] {item.get('message')}")
+                lines.append("")
+
+            lines.append("### Iteration Trace")
+            iteration_traces = loop_result.get("iteration_traces", [])
+            if not iteration_traces:
+                lines.append("- (no trace captured)")
+                lines.append("")
+            else:
+                for iter_item in iteration_traces:
+                    iter_no = iter_item.get("iteration")
+                    lines.append(f"#### Iteration {iter_no}")
+                    plan = iter_item.get("assistant_plan") or ""
+                    reasoning = iter_item.get("reasoning") or ""
+                    if plan:
+                        lines.append("Plan / Thought:")
+                        lines.append(self._truncate_text(plan, 1800))
+                        lines.append("")
+                    if reasoning:
+                        lines.append("Reasoning:")
+                        lines.append(self._truncate_text(reasoning, 1800))
+                        lines.append("")
+
+                    iter_adv = iter_item.get("advisories") or []
+                    if iter_adv:
+                        lines.append("Advisories:")
+                        for msg in iter_adv:
+                            lines.append(f"- {msg}")
+                        lines.append("")
+
+                    tool_entries = iter_item.get("tool_calls") or []
+                    if tool_entries:
+                        lines.append("Tool Calls:")
+                        for idx, entry in enumerate(tool_entries, 1):
+                            lines.append(f"{idx}. `{entry.get('name')}`")
+                            lines.append(f"- cached: `{entry.get('cached')}`")
+                            arg_str = json.dumps(entry.get("args", {}), ensure_ascii=False)
+                            lines.append(f"- args: `{self._truncate_text(arg_str, 800)}`")
+                            summary = entry.get("result_summary") or {}
+                            lines.append(f"- success: `{summary.get('success')}`")
+                            if summary.get("error"):
+                                lines.append(f"- error: `{summary.get('error')}`")
+                            for hl in summary.get("highlights", []):
+                                lines.append(f"- {hl}")
+                            for image_path in summary.get("image_paths", []):
+                                md_path = self._to_workspace_markdown_path(image_path)
+                                lines.append(f"- image_path: `{image_path}`")
+                                lines.append(f"![iter{iter_no}-tool{idx}]({md_path})")
+                            lines.append("")
+                    lines.append(f"Progress: {iter_item.get('summary', '')}")
+                    lines.append("")
+
+            lines.append("### Final Answer")
+            lines.append(self._truncate_text(loop_result.get("text", ""), 3000))
+            lines.append("")
+            lines.append("---")
+            lines.append("")
+
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+
+            return str(log_path)
+        except Exception as e:
+            debug_print(f"⚠️ 自动详细工作日志写入失败: {e}")
+            return None
 
     def _sanitize_tool_result(self, tool_name: str, result: Dict[str, Any]) -> Dict[str, Any]:
         """
         Trim oversized tool payloads before they are appended into chat history.
         """
-        if not isinstance(result, dict):
-            return {"success": False, "error": f"工具 {tool_name} 返回了无效结果格式"}
-
-        safe = dict(result)
+        safe = self._normalize_tool_result(result)
         data = safe.get("data")
         if isinstance(data, dict):
             safe_data = dict(data)
@@ -614,6 +1020,7 @@ class MemoryDrivenAgent:
             src = safe["data"]
             for key in (
                 "image_path",
+                "thumbnail",
                 "region_info",
                 "entity_summary",
                 "key_content",

@@ -7,6 +7,9 @@ CAD 渲染器 - 使用 matplotlib 渲染 DXF 文件
 
 import gc
 import os
+import io
+import warnings
+import contextlib
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -50,6 +53,15 @@ _CJK_FONT_CANDIDATES = [
     "Arial Unicode MS",
 ]
 _TEXT_FONT = None
+
+
+@contextlib.contextmanager
+def _suppress_ezdxf_noise():
+    """
+    Silence noisy third-party prints (e.g. ACAD_PROXY_OBJECT copy warnings).
+    """
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        yield
 
 
 def get_layer_color(layer_name: str) -> str:
@@ -209,13 +221,19 @@ def render_drawing_region(
         _render_entities(ax, msp, bbox, layers, color_mode, pixels_per_unit)
 
         # 禁用 bbox_inches='tight'，避免文字外扩导致导出尺寸爆炸。
-        fig.savefig(
-            output_path,
-            dpi=DEFAULT_DPI,
-            facecolor="white",
-            edgecolor="white",
-            transparent=False,
-        )
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r"Glyph .* missing from font\(s\).*",
+                category=UserWarning,
+            )
+            fig.savefig(
+                output_path,
+                dpi=DEFAULT_DPI,
+                facecolor="white",
+                edgecolor="white",
+                transparent=False,
+            )
 
         plt.close(fig)
         gc.collect()
@@ -290,8 +308,9 @@ def _iter_entities(msp, include_insert_virtual: bool = True) -> Iterable[Any]:
     for entity in msp:
         if include_insert_virtual and entity.dxftype() == "INSERT":
             try:
-                for sub_entity in entity.virtual_entities():
-                    yield sub_entity
+                with _suppress_ezdxf_noise():
+                    for sub_entity in entity.virtual_entities():
+                        yield sub_entity
             except Exception:
                 pass
         yield entity

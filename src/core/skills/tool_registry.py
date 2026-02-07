@@ -99,6 +99,14 @@ class ToolRegistry:
             else:
                 result = await tool_function(**kwargs) if inspect.iscoroutinefunction(tool_function) else tool_function(**kwargs)
 
+            # If tool already follows the standard result envelope, keep it as-is.
+            if isinstance(result, dict) and "success" in result and ("data" in result or "error" in result):
+                return result
+
+            # Backward compatibility: tools that return {"error": "..."} without envelope.
+            if isinstance(result, dict) and isinstance(result.get("error"), str):
+                return {"success": False, "error": result["error"]}
+
             return {"success": True, "data": result}
         except Exception as e:
             return {"success": False, "error": str(e)}
